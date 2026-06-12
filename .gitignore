@@ -1,0 +1,6 @@
+﻿venv/
+.env
+__pycache__/
+*.pyc
+my_local_db/
+chroma_langchain_db/
