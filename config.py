@@ -38,7 +38,7 @@ class Paths:
     # Source documents directory — add .txt, .md, .pdf files here
     data_dir: Path = _BASE_DIR / "data"
 
-    # Single-document path (MVP); will be replaced by glob-based loading in Commit 3
+    # Legacy single-document path (used only if data_dir glob finds nothing)
     policy_doc: Path = _BASE_DIR / "data" / "policy.txt"
 
     # Persistent vector database directory (git-ignored in .gitignore)
@@ -79,6 +79,12 @@ class IngestionConfig:
     )
     embedding_model: str = "text-embedding-3-small"
     collection_name: str = "policy_docs"
+
+    # Glob pattern for source documents (supports .txt, .md, .pdf)
+    data_glob_pattern: str = "*.*"
+
+    # Maximum individual file size for ingestion (prevents OOM on large PDFs)
+    max_file_size_mb: int = 50
 
 
 @dataclass(frozen=True)
