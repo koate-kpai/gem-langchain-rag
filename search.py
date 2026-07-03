@@ -8,10 +8,20 @@ Security & Operations Philosophy
 - Defense-in-depth: API key validation before any external call
 - Cost-aware retrieval: config.retrieval.retriever_k limits context token spend
 - Fail gracefully: guardrails for missing database, empty collection, invalid config
-- Source-grounded: future commits add relevance scoring and citation metadata
+- Source-grounded: every answer includes citations showing which policy document
+  and chunk were used, with relevance scores for transparency
+
+Responsible AI Note
+-------------------
+Source citation is a critical guardrail against hallucination. By showing the
+user exactly which documents informed the answer, we enable:
+  1. Trust verification — users can read the source directly
+  2. Error detection — low-relevance sources alert users to weak retrieval
+  3. Auditability — every answer is traceable to its source material
 """
 import os
 import re
+import sys
 import logging
 from dotenv import load_dotenv
 
@@ -62,10 +72,78 @@ def _validate_api_key(key: str | None) -> str:
     return key
 
 
-def format_docs(docs):
-    return "\n\n".join(doc.page_content for doc in docs)
+# ---------------------------------------------------------------------------
+# Source-aware document formatting
+# ---------------------------------------------------------------------------
+def format_docs_with_sources(docs_and_scores: list[tuple]) -> str:
+    """Format retrieved documents with source citations and relevance scores.
+
+    Each chunk is tagged with:
+      [Source: filename (Relevance: 0.XX)]
+
+    This gives the LLM explicit context boundaries AND makes the source
+    provenance visible to the end user. The relevance score (cosine similarity
+    to the query embedding) helps users gauge confidence.
+
+    Args:
+        docs_and_scores: List of (Document, score) tuples from
+            similarity_search_with_relevance_scores.
+
+    Returns:
+        Formatted context string with source tags.
+    """
+    formatted_parts = []
+    for idx, (doc, score) in enumerate(docs_and_scores, start=1):
+        # Extract the source filename from metadata (LangChain adds 'source' automatically)
+        source_file = doc.metadata.get("source", "unknown")
+        source_name = source_file.split("\\")[-1].split("/")[-1]  # cross-platform basename
+
+        # Build a tagged chunk with relevance score
+        tagged = (
+            f"[Source: {source_name} (Chunk {idx}, Relevance: {score:.3f})]\n"
+            f"{doc.page_content}"
+        )
+        formatted_parts.append(tagged)
+
+    return "\n\n---\n\n".join(formatted_parts)
 
 
+def print_sources(docs_and_scores: list[tuple]) -> None:
+    """Print a human-readable source summary for the user.
+
+    Shows:
+      - Which files were used
+      - Individual chunk relevance scores
+      - Total number of chunks retrieved
+
+    This is printed AFTER the LLM answer so the user can verify the response
+    against its source material.
+    """
+    print("\n" + "-" * 40)
+    print("📚 SOURCES CONSULTED:")
+    print("-" * 40)
+    for idx, (doc, score) in enumerate(docs_and_scores, start=1):
+        source_file = doc.metadata.get("source", "unknown")
+        source_name = source_file.split("\\")[-1].split("/")[-1]
+        print(f"  {idx}. {source_name} — Relevance: {score:.3f}")
+    print(f"\n  Total chunks retrieved: {len(docs_and_scores)}")
+
+    # Verbose mode: dump full chunk text for debugging
+    if "--verbose" in sys.argv or "-v" in sys.argv:
+        print("\n" + "-" * 40)
+        print("🔍 RAW CHUNKS (verbose):")
+        print("-" * 40)
+        for idx, (doc, _score) in enumerate(docs_and_scores, start=1):
+            source_file = doc.metadata.get("source", "unknown")
+            source_name = source_file.split("\\")[-1].split("/")[-1]
+            print(f"\n--- Chunk {idx} ({source_name}) ---")
+            print(doc.page_content)
+    print("-" * 40)
+
+
+# ---------------------------------------------------------------------------
+# Main query pipeline
+# ---------------------------------------------------------------------------
 def run_query(user_question):
     logging.info("Initializing vector store retriever...")
 
@@ -100,22 +178,36 @@ def run_query(user_question):
         return
 
     # 2. Guardrail: Ensure the collection actually contains data
-    #    (counts documents, works even if collection exists but is empty)
     if vectorstore._collection.count() == 0:
         print("\n❌ Error: The ChromaDB database is empty.")
         print("Please run the ingestion script to populate it with documents.\n")
         return
 
-    retriever = vectorstore.as_retriever(
-        search_kwargs={"k": config.retrieval.retriever_k}
+    # 3. Retrieve documents WITH relevance scores
+    #    similarity_search_with_relevance_scores returns (Document, score) tuples
+    #    where score is the cosine similarity (0 to 1, higher = more relevant).
+    logging.info(
+        "Retrieving top-%d chunks for query: '%s'",
+        config.retrieval.retriever_k,
+        user_question,
+    )
+    docs_and_scores = vectorstore.similarity_search_with_relevance_scores(
+        user_question,
+        k=config.retrieval.retriever_k,
     )
 
-    # 3. Build prompt
+    if not docs_and_scores:
+        print("\n❌ No relevant documents found for your query.")
+        return
+
+    # 4. Build prompt with source-tagged context
     system_prompt = (
-        "You are a helpful HR assistant.\n"
-        "Answer the user's question using ONLY the provided context below. "
-        "If you do not know the answer based strictly on the context, say "
-        "'I cannot find that in the company policy manual.'\n\n"
+        "You are a helpful HR assistant. Answer the user's question using ONLY "
+        "the provided context below. Each context chunk is tagged with its source "
+        "file and relevance score. If the context does not contain the answer, "
+        "say 'I cannot find that in the company policy manual.'\n\n"
+        "When you use information from a specific source, cite it inline:\n"
+        '  "According to the [Source Name], ..."\n\n'
         "CONTEXT:\n{context}"
     )
     prompt = ChatPromptTemplate.from_messages(
@@ -125,22 +217,32 @@ def run_query(user_question):
         ]
     )
 
-    # 4. LCEL pipeline
+    # Extract just the documents (drop scores) for the retriever chain
+    retrieved_docs = [doc for doc, _ in docs_and_scores]
+
+    # 5. LCEL pipeline
     logging.info("Building LCEL Chain...")
     rag_chain = (
-        {"context": retriever | format_docs, "question": RunnablePassthrough()}
+        {
+            "context": RunnablePassthrough() | (lambda _: format_docs_with_sources(docs_and_scores)),
+            "question": RunnablePassthrough(),
+        }
         | prompt
         | llm
         | StrOutputParser()
     )
 
-    # 5. Execute
-    logging.info("Executing pipeline for query: '%s'", user_question)
+    # 6. Execute
+    logging.info("Generating answer...")
     response = rag_chain.invoke(user_question)
 
+    # 7. Print results
     print("\n" + "=" * 40)
     print(f"🤖 AI ANSWER:\n{response}")
-    print("=" * 40 + "\n")
+    print("=" * 40)
+
+    # 8. Print source citations for transparency
+    print_sources(docs_and_scores)
 
 
 if __name__ == "__main__":
