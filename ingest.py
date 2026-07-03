@@ -28,6 +28,7 @@ from chromadb.errors import NotFoundError
 
 from config import config  # centralized 12-factor config (see config.py)
 from loaders import find_documents, get_loader_for_file, validate_file_size
+from retry import call_with_retry  # exponential backoff for API resilience
 
 # Load environment variables from .env (must exist before any API calls)
 load_dotenv(dotenv_path=config.paths.env_file)
@@ -206,12 +207,13 @@ def ingest_data():
             logging.info("Deleted collection '%s'.", config.ingestion.collection_name)
         except NotFoundError:
             logging.info("No existing collection to delete.")
-        vectorstore = Chroma.from_documents(
+        vectorstore = call_with_retry(
+            Chroma.from_documents,
             documents=chunks,
             embedding=embeddings,
             persist_directory=str(config.paths.vector_db_dir),
             collection_name=config.ingestion.collection_name,
-            ids=chunk_ids,  # may be None if dedup disabled
+            ids=chunk_ids,
         )
         logging.info("Reindexed %d chunks into fresh collection.", len(chunks))
     else:
@@ -231,7 +233,11 @@ def ingest_data():
                 existing_count,
                 len(chunks),
             )
-        vectorstore.add_documents(documents=chunks, ids=chunk_ids)
+        call_with_retry(
+            vectorstore.add_documents,
+            documents=chunks,
+            ids=chunk_ids,
+        )
         final_count = vectorstore._collection.count()
         logging.info(
             "Incremental ingest complete. Collection now has %d documents.",

@@ -34,6 +34,7 @@ from langchain_core.output_parsers import StrOutputParser
 from chromadb.errors import NotFoundError  # to catch missing DB/collection
 
 from config import config  # centralized 12-factor config (see config.py)
+from retry import call_with_retry  # exponential backoff for API resilience
 
 # Load .env — fail immediately if missing (don't let OpenAI return a cryptic 401)
 load_dotenv(dotenv_path=config.paths.env_file)
@@ -205,32 +206,32 @@ def run_query(user_question: str) -> float | None:
     # 3. Retrieve documents WITH relevance scores
     t_retrieval_start = time.perf_counter()
 
-    # Use the configured search type (similarity or MMR)
+    # Wrap the retrieval in retry logic — transient API failures during
+    # embedding should not crash the pipeline. The retry module handles
+    # exponential backoff for 429 (rate limit) and 5xx (server error).
     if config.retrieval.search_type == "mmr":
-        # MMR (Maximum Marginal Relevance): diversifies results by penalizing
-        # chunks too similar to already-selected ones. This prevents 3 chunks
-        # from the same paragraph dominating the context window.
-        #
-        # Note: max_marginal_relevance_search returns docs only (no scores).
-        # We assign a neutral score of 0.5 for display consistency.
-        mmr_docs = vectorstore.max_marginal_relevance_search(
-            user_question,
+        _search_func = lambda q: vectorstore.max_marginal_relevance_search(
+            q,
             k=config.retrieval.retriever_k,
             fetch_k=config.retrieval.mmr_fetch_k,
             lambda_mult=config.retrieval.mmr_lambda_mult,
         )
-        docs_and_scores = [(doc, 0.5) for doc in mmr_docs]
+    else:
+        _search_func = lambda q: vectorstore.similarity_search_with_relevance_scores(
+            q,
+            k=config.retrieval.retriever_k,
+        )
+    docs_and_scores = call_with_retry(_search_func, user_question)
+
+    # For MMR, max_marginal_relevance_search returns docs only (no scores).
+    # We assign a neutral score of 0.5 for display consistency.
+    if config.retrieval.search_type == "mmr":
+        docs_and_scores = [(doc, 0.5) for doc in docs_and_scores]
         logging.info(
             "MMR retrieval: k=%d, fetch_k=%d, lambda_mult=%.1f",
             config.retrieval.retriever_k,
             config.retrieval.mmr_fetch_k,
             config.retrieval.mmr_lambda_mult,
-        )
-    else:
-        # Plain cosine similarity search (default)
-        docs_and_scores = vectorstore.similarity_search_with_relevance_scores(
-            user_question,
-            k=config.retrieval.retriever_k,
         )
 
     t_retrieval_elapsed = time.perf_counter() - t_retrieval_start
@@ -278,7 +279,9 @@ def run_query(user_question: str) -> float | None:
     print("-" * 40)
 
     response_parts: list[str] = []
-    for chunk in rag_chain.stream(user_question):
+    # Wrap the streaming invocation in retry logic
+    stream_iter = call_with_retry(lambda: rag_chain.stream(user_question))
+    for chunk in stream_iter:
         print(chunk, end="", flush=True)
         response_parts.append(chunk)
 
