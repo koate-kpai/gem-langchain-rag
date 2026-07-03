@@ -122,6 +122,16 @@ class RetrievalConfig:
     llm_model: str = "gpt-4o-mini"
     llm_temperature: float = 0.0
 
+    # MMR (Maximum Marginal Relevance) settings
+    # MMR diversifies retrieved results by penalizing chunks that are too
+    # similar to each other. This reduces redundancy and improves coverage.
+    # Plain similarity search (search_type="similarity") is the default.
+    # MMR search (search_type="mmr") adds lambda_mult to control diversity:
+    #   1.0 = pure similarity (no diversity), 0.0 = pure diversity
+    search_type: str = "mmr"
+    mmr_lambda_mult: float = 0.5
+    mmr_fetch_k: int = 20  # number of candidates to fetch before MMR selection
+
 
 @dataclass(frozen=True)
 class AppConfig:

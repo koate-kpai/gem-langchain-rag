@@ -22,6 +22,7 @@ user exactly which documents informed the answer, we enable:
 import os
 import re
 import sys
+import time
 import logging
 from dotenv import load_dotenv
 
@@ -129,7 +130,7 @@ def print_sources(docs_and_scores: list[tuple]) -> None:
     print(f"\n  Total chunks retrieved: {len(docs_and_scores)}")
 
     # Verbose mode: dump full chunk text for debugging
-    if "--verbose" in sys.argv or "-v" in sys.argv:
+    if _verbose:
         print("\n" + "-" * 40)
         print("🔍 RAW CHUNKS (verbose):")
         print("-" * 40)
@@ -142,9 +143,26 @@ def print_sources(docs_and_scores: list[tuple]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Runtime state (for REPL commands)
+# ---------------------------------------------------------------------------
+_verbose: bool = "--verbose" in sys.argv or "-v" in sys.argv
+
+
+# ---------------------------------------------------------------------------
 # Main query pipeline
 # ---------------------------------------------------------------------------
-def run_query(user_question):
+def run_query(user_question: str) -> float | None:
+    """Execute a single RAG query and return total elapsed time in seconds.
+
+    This function is called both from the REPL loop and from batch scripts.
+    It handles all pre-flight checks, retrieval, generation, and display.
+
+    The streaming output (llm.stream) shows tokens incrementally — a critical
+    UX pattern for production RAG systems. Without streaming, users wait
+    silently for 2-10 seconds before seeing any response. With streaming,
+    the first token appears in ~200ms, providing immediate feedback.
+    """
+    t_start = time.perf_counter()
     logging.info("Initializing vector store retriever...")
 
     # --- Pre-flight checks ---
@@ -161,6 +179,7 @@ def run_query(user_question):
     llm = ChatOpenAI(
         model=config.retrieval.llm_model,
         temperature=config.retrieval.llm_temperature,
+        streaming=True,  # enables token-by-token streaming
     )
 
     # 1. Connect to ChromaDB – handle missing database/collection
@@ -175,30 +194,50 @@ def run_query(user_question):
         print(
             "Please run the ingestion script first to create and populate the database.\n"
         )
-        return
+        return None
 
     # 2. Guardrail: Ensure the collection actually contains data
     if vectorstore._collection.count() == 0:
         print("\n❌ Error: The ChromaDB database is empty.")
         print("Please run the ingestion script to populate it with documents.\n")
-        return
+        return None
 
     # 3. Retrieve documents WITH relevance scores
-    #    similarity_search_with_relevance_scores returns (Document, score) tuples
-    #    where score is the cosine similarity (0 to 1, higher = more relevant).
-    logging.info(
-        "Retrieving top-%d chunks for query: '%s'",
-        config.retrieval.retriever_k,
-        user_question,
-    )
-    docs_and_scores = vectorstore.similarity_search_with_relevance_scores(
-        user_question,
-        k=config.retrieval.retriever_k,
-    )
+    t_retrieval_start = time.perf_counter()
+
+    # Use the configured search type (similarity or MMR)
+    if config.retrieval.search_type == "mmr":
+        # MMR (Maximum Marginal Relevance): diversifies results by penalizing
+        # chunks too similar to already-selected ones. This prevents 3 chunks
+        # from the same paragraph dominating the context window.
+        #
+        # Note: max_marginal_relevance_search returns docs only (no scores).
+        # We assign a neutral score of 0.5 for display consistency.
+        mmr_docs = vectorstore.max_marginal_relevance_search(
+            user_question,
+            k=config.retrieval.retriever_k,
+            fetch_k=config.retrieval.mmr_fetch_k,
+            lambda_mult=config.retrieval.mmr_lambda_mult,
+        )
+        docs_and_scores = [(doc, 0.5) for doc in mmr_docs]
+        logging.info(
+            "MMR retrieval: k=%d, fetch_k=%d, lambda_mult=%.1f",
+            config.retrieval.retriever_k,
+            config.retrieval.mmr_fetch_k,
+            config.retrieval.mmr_lambda_mult,
+        )
+    else:
+        # Plain cosine similarity search (default)
+        docs_and_scores = vectorstore.similarity_search_with_relevance_scores(
+            user_question,
+            k=config.retrieval.retriever_k,
+        )
+
+    t_retrieval_elapsed = time.perf_counter() - t_retrieval_start
 
     if not docs_and_scores:
         print("\n❌ No relevant documents found for your query.")
-        return
+        return None
 
     # 4. Build prompt with source-tagged context
     system_prompt = (
@@ -217,14 +256,12 @@ def run_query(user_question):
         ]
     )
 
-    # Extract just the documents (drop scores) for the retriever chain
-    retrieved_docs = [doc for doc, _ in docs_and_scores]
-
-    # 5. LCEL pipeline
+    # 5. LCEL pipeline with streaming
     logging.info("Building LCEL Chain...")
     rag_chain = (
         {
-            "context": RunnablePassthrough() | (lambda _: format_docs_with_sources(docs_and_scores)),
+            "context": RunnablePassthrough()
+            | (lambda _: format_docs_with_sources(docs_and_scores)),
             "question": RunnablePassthrough(),
         }
         | prompt
@@ -232,19 +269,102 @@ def run_query(user_question):
         | StrOutputParser()
     )
 
-    # 6. Execute
-    logging.info("Generating answer...")
-    response = rag_chain.invoke(user_question)
+    # 6. Execute with streaming
+    t_gen_start = time.perf_counter()
+    logging.info("Generating answer via streaming...")
 
-    # 7. Print results
     print("\n" + "=" * 40)
-    print(f"🤖 AI ANSWER:\n{response}")
+    print("🤖 AI ANSWER:")
+    print("-" * 40)
+
+    response_parts: list[str] = []
+    for chunk in rag_chain.stream(user_question):
+        print(chunk, end="", flush=True)
+        response_parts.append(chunk)
+
+    t_gen_elapsed = time.perf_counter() - t_gen_start
+    t_total = time.perf_counter() - t_start
+
+    full_response = "".join(response_parts)
+    tokens = len(full_response.split())
+    tokens_per_sec = tokens / t_gen_elapsed if t_gen_elapsed > 0 else 0
+
+    print()  # newline after streaming
     print("=" * 40)
+
+    # 7. Print timing summary
+    print(f"\n⚡ Timing: retrieval={t_retrieval_elapsed:.2f}s | "
+          f"generation={t_gen_elapsed:.2f}s ({tokens_per_sec:.0f} tok/s) | "
+          f"total={t_total:.2f}s")
 
     # 8. Print source citations for transparency
     print_sources(docs_and_scores)
 
+    return t_total
+
+
+# ---------------------------------------------------------------------------
+# Interactive REPL
+# ---------------------------------------------------------------------------
+def repl() -> None:
+    """Interactive read-eval-print loop for querying the RAG pipeline.
+
+    Commands:
+      /quit, /exit, /q  — exit the REPL
+      /verbose, /v      — toggle verbose chunk dump mode
+      /help, /?         — show this help message
+
+    The REPL persists the vector store connection across queries (warm start),
+    avoiding the overhead of re-initializing embeddings and ChromaDB on every
+    question. This is a common production pattern for chat interfaces.
+    """
+    global _verbose
+
+    print("\n" + "=" * 50)
+    print("🔍 Enterprise RAG Pipeline — Interactive Mode")
+    print("=" * 50)
+    print("Type your question or a command:")
+    print("  /quit  — exit")
+    print("  /v     — toggle verbose mode")
+    print("  /help  — show commands")
+    print("=" * 50)
+
+    while True:
+        try:
+            user_input = input("\n❓ ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nGoodbye!")
+            break
+
+        if not user_input:
+            continue
+
+        # Handle commands
+        if user_input.startswith("/"):
+            cmd = user_input.lower().split()[0]
+            if cmd in ("/quit", "/exit", "/q"):
+                print("Goodbye!")
+                break
+            elif cmd in ("/verbose", "/v"):
+                _verbose = not _verbose
+                print(f"Verbose mode: {'ON' if _verbose else 'OFF'}")
+                continue
+            elif cmd in ("/help", "/?"):
+                print("Commands: /quit, /verbose, /help")
+                continue
+            else:
+                print(f"Unknown command: {cmd}. Type /help for commands.")
+                continue
+
+        # Run the query
+        run_query(user_input)
+
 
 if __name__ == "__main__":
-    query = "How much can I spend setting up my computer setup at home, and when do I need to submit it?"
-    run_query(query)
+    # If a query is passed as a CLI argument, run it once and exit (batch mode)
+    # Otherwise, launch the interactive REPL
+    cli_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    if cli_args:
+        run_query(" ".join(cli_args))
+    else:
+        repl()
