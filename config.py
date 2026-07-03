@@ -86,6 +86,14 @@ class IngestionConfig:
     # Maximum individual file size for ingestion (prevents OOM on large PDFs)
     max_file_size_mb: int = 50
 
+    # If True, delete and rebuild the entire collection on every run.
+    # If False (default), upsert only new/changed chunks via content-addressed IDs.
+    force_reindex: bool = False
+
+    # Enable content-addressed deduplication (SHA-256 hash of content + source).
+    # Disable only if you need to force all chunks to be re-embedded.
+    enable_dedup: bool = True
+
 
 @dataclass(frozen=True)
 class RetrievalConfig:

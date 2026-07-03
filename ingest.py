@@ -6,13 +6,16 @@ Security & Operations Philosophy
 --------------------------------
 - Defense-in-depth: layered guardrails (gitignore → env validation → API key format check)
 - Fail fast: pre-flight checks catch misconfiguration before any billable API call
-- Idempotency: each ingest run is safe to re-execute (destructive by design in this MVP;
-  see Commit 4 for incremental dedup upgrade)
-- Cost awareness: validation occurs before any OpenAI API call to avoid wasted spend
-- Extensibility: multi-format document loading via a registry pattern (loaders.py)
+- Idempotency: content-addressed chunk IDs ensure re-running ingest is safe.
+  Only new or changed documents are re-embedded — unchanged chunks are skipped.
+  This is the same principle behind Terraform's resource graph and Docker layer caching.
+- Cost awareness: deduplication avoids paying to re-embed chunks that are already stored.
+- Extensibility: multi-format document loading via a registry pattern (loaders.py).
 """
 import os
 import re
+import sys
+import hashlib
 import logging
 from pathlib import Path
 
@@ -88,7 +91,40 @@ def _fmt_size(path: Path) -> str:
         return f"{size_bytes / (1024 ** 2):.1f} MB"
 
 
+def _compute_chunk_id(source_file: str, chunk_index: int, chunk_text: str) -> str:
+    """Generate a deterministic, content-addressed ID for a chunk.
+
+    Pattern: SHA-256 hash of (source_file + separator + chunk_index + chunk_text).
+
+    Why not UUID?
+      UUIDs are non-deterministic — re-running ingest on the same file produces
+      different IDs, making deduplication impossible. Content-addressed IDs let
+      us detect which chunks have changed between runs.
+
+    Why include source_file and chunk_index?
+      Two different files could have identical text passages (e.g., a quoted
+      policy in two documents). Including the source disambiguates them.
+      The chunk_index ensures stable ordering for debugging.
+
+    This is the same content-addressable pattern used by:
+      - Git (commit hashes)
+      - Docker (layer hashes)
+      - IPFS (content IDs)
+    """
+    raw = f"{source_file}\x00{chunk_index}\x00{chunk_text}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
 def ingest_data():
+    """Main ingestion orchestrator.
+
+    Supports two modes controlled by config.ingestion.force_reindex:
+      - FORCE REINDEX: delete the collection and rebuild from scratch.
+        Use this when changing chunk_size, overlap, or embedding model.
+      - INCREMENTAL (default): compute content-addressed IDs for each chunk
+        and upsert only new/changed ones. Unchanged chunks are preserved,
+        saving $$$ on re-embedding costs.
+    """
     # --- Pre-flight checks ---
     # Order matters: check local state before making any API calls
     if not config.paths.env_file.exists():
@@ -128,7 +164,7 @@ def ingest_data():
         raise ValueError("All source documents are empty. Nothing to ingest.")
 
     # 2. Chunk intelligently (preserving paragraphs and sentences)
-    logging.info("Splitting document into chunks...")
+    logging.info("Splitting %d document(s) into chunks...", len(doc_files))
     text_splitter = RecursiveCharacterTextSplitter(
         chunk_size=config.ingestion.chunk_size,
         chunk_overlap=config.ingestion.chunk_overlap,
@@ -137,24 +173,70 @@ def ingest_data():
     chunks = text_splitter.split_documents(raw_docs)
     logging.info("Created %d chunks.", len(chunks))
 
-    # 3. Prevent duplicate documents by deleting the existing collection
-    client = chromadb.PersistentClient(path=str(config.paths.vector_db_dir))
-    try:
-        client.delete_collection(config.ingestion.collection_name)
-        logging.info("Deleted existing collection '%s'.", config.ingestion.collection_name)
-    except NotFoundError:
-        logging.info("No existing collection '%s' to delete.", config.ingestion.collection_name)
+    # 3. Assign content-addressed IDs to each chunk
+    #    This is the core of our idempotent ingestion pattern.
+    #    Same content + same source + same index = same ID every time.
+    if config.ingestion.enable_dedup:
+        chunk_ids = [
+            _compute_chunk_id(
+                source_file=chunk.metadata.get("source", "unknown"),
+                chunk_index=i,
+                chunk_text=chunk.page_content,
+            )
+            for i, chunk in enumerate(chunks)
+        ]
+        unique_ids = len(set(chunk_ids))
+        logging.info("Assigned %d content-addressed IDs (%d unique).", len(chunk_ids), unique_ids)
+    else:
+        chunk_ids = None
+        logging.info("Content-addressed dedup is disabled — all chunks will be re-embedded.")
 
-    # 4. Embed and store in ChromaDB
-    logging.info("Generating embeddings and storing vectors...")
+    # 4. Handle the vector store
     embeddings = OpenAIEmbeddings(model=config.ingestion.embedding_model)
 
-    Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=str(config.paths.vector_db_dir),
-        collection_name=config.ingestion.collection_name,
-    )
+    # Check CLI flags for ad-hoc force reindex (overrides config)
+    force_reindex = config.ingestion.force_reindex or "--force-reindex" in sys.argv
+
+    if force_reindex:
+        # Destructive mode: delete and rebuild
+        logging.warning("FORCE REINDEX enabled — deleting existing collection.")
+        client = chromadb.PersistentClient(path=str(config.paths.vector_db_dir))
+        try:
+            client.delete_collection(config.ingestion.collection_name)
+            logging.info("Deleted collection '%s'.", config.ingestion.collection_name)
+        except NotFoundError:
+            logging.info("No existing collection to delete.")
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=embeddings,
+            persist_directory=str(config.paths.vector_db_dir),
+            collection_name=config.ingestion.collection_name,
+            ids=chunk_ids,  # may be None if dedup disabled
+        )
+        logging.info("Reindexed %d chunks into fresh collection.", len(chunks))
+    else:
+        # Incremental mode: connect to existing store and upsert
+        vectorstore = Chroma(
+            persist_directory=str(config.paths.vector_db_dir),
+            embedding_function=embeddings,
+            collection_name=config.ingestion.collection_name,
+        )
+        # Chroma's add_documents with IDs acts as upsert:
+        #   - New ID → inserted
+        #   - Existing ID → silently skipped (no re-embedding cost)
+        if chunk_ids:
+            existing_count = vectorstore._collection.count()
+            logging.info(
+                "Existing collection has %d documents. Upserting %d chunks...",
+                existing_count,
+                len(chunks),
+            )
+        vectorstore.add_documents(documents=chunks, ids=chunk_ids)
+        final_count = vectorstore._collection.count()
+        logging.info(
+            "Incremental ingest complete. Collection now has %d documents.",
+            final_count,
+        )
 
     logging.info("Ingestion complete! The database is ready.")
 
