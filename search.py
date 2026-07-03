@@ -6,14 +6,13 @@ and generates a grounded answer using an LLM.
 Security & Operations Philosophy
 --------------------------------
 - Defense-in-depth: API key validation before any external call
-- Cost-aware retrieval: k=2 limits context token usage ($0.0015/query at gpt-4o-mini pricing)
+- Cost-aware retrieval: config.retrieval.retriever_k limits context token spend
 - Fail gracefully: guardrails for missing database, empty collection, invalid config
 - Source-grounded: future commits add relevance scoring and citation metadata
 """
 import os
 import re
 import logging
-from pathlib import Path
 from dotenv import load_dotenv
 
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
@@ -23,18 +22,15 @@ from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from chromadb.errors import NotFoundError  # to catch missing DB/collection
 
+from config import config  # centralized 12-factor config (see config.py)
+
 # Load .env — fail immediately if missing (don't let OpenAI return a cryptic 401)
-env_path = Path(__file__).resolve().parent / ".env"
-load_dotenv(dotenv_path=env_path)
+load_dotenv(dotenv_path=config.paths.env_file)
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-
-BASE_DIR = Path(__file__).resolve().parent
-DB_DIR = BASE_DIR / "chroma_langchain_db"
-COLLECTION_NAME = "policy_docs"
 
 
 # ---------------------------------------------------------------------------
@@ -75,23 +71,26 @@ def run_query(user_question):
 
     # --- Pre-flight checks ---
     # Fail fast: validate environment before any external API call
-    if not env_path.exists():
+    if not config.paths.env_file.exists():
         raise FileNotFoundError(
-            f"Configuration file not found: {env_path}\n"
+            f"Configuration file not found: {config.paths.env_file}\n"
             "Copy .env.example to .env and add your OpenAI API key:\n\n"
             "    copy .env.example .env"
         )
     _validate_api_key(os.getenv("OPENAI_API_KEY"))
 
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.0)
+    embeddings = OpenAIEmbeddings(model=config.ingestion.embedding_model)
+    llm = ChatOpenAI(
+        model=config.retrieval.llm_model,
+        temperature=config.retrieval.llm_temperature,
+    )
 
     # 1. Connect to ChromaDB – handle missing database/collection
     try:
         vectorstore = Chroma(
-            persist_directory=str(DB_DIR),
+            persist_directory=str(config.paths.vector_db_dir),
             embedding_function=embeddings,
-            collection_name=COLLECTION_NAME,
+            collection_name=config.ingestion.collection_name,
         )
     except NotFoundError:
         print("\n❌ Error: The ChromaDB collection was not found.")
@@ -107,7 +106,9 @@ def run_query(user_question):
         print("Please run the ingestion script to populate it with documents.\n")
         return
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": config.retrieval.retriever_k}
+    )
 
     # 3. Build prompt
     system_prompt = (
